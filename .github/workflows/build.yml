@@ -1,0 +1,65 @@
+name: build
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+  push:
+    branches: [main]
+concurrency: build
+permissions:
+  contents: write
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  draft:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.draft.outputs.tag }}
+      names: ${{ steps.draft.outputs.names }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: draft
+        run: |
+          tag=$(date -u +%Y%m%d)-${{ github.run_number }}
+          gh release create "$tag" --draft --title "$tag" --notes "Cloud images, packages up to date, qemu-guest-agent installed."
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "names=$(jq -c 'map(.name)' images.json)" >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: draft
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        name: ${{ fromJSON(needs.draft.outputs.names) }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils genisoimage
+          sudo chmod 666 /dev/kvm
+      - run: ./build.sh ${{ matrix.name }}
+      - run: gh release upload ${{ needs.draft.outputs.tag }} ${{ matrix.name }}.qcow2 ${{ matrix.name }}.json
+
+  publish:
+    needs: [draft, build]
+    if: ${{ !cancelled() && needs.draft.result == 'success' }}
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.draft.outputs.tag }}
+      FILES: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ needs.draft.outputs.tag }}
+    steps:
+      - name: Drop the draft when no image was built
+        run: gh release download "$TAG" --pattern '*.json' --dir built || { gh release delete "$TAG" -y; exit 1; }
+      - name: Replace the per-image files by manifest.json
+        run: |
+          jq -s 'map({os, version, family, url: "\(env.FILES)/\(.file)", sha256})' built/*.json >manifest.json
+          gh release upload "$TAG" manifest.json
+          for f in built/*.json; do gh release delete-asset "$TAG" "$(basename "$f")" -y; done
+      - name: Publish and keep the last 4 releases
+        run: |
+          gh release edit "$TAG" --draft=false --latest
+          gh release list --exclude-drafts --limit 100 --json tagName --jq '.[4:][].tagName' | xargs -r -n1 gh release delete -y --cleanup-tag
